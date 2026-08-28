@@ -15,18 +15,24 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: invitext-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            archive: invitext-portable-linux-x86_64
+            rustflags: ""
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            archive: invitext-macos-x86_64
+            archive: invitext-portable-macos-x86_64
+            rustflags: ""
           - os: macos-15
             target: aarch64-apple-darwin
-            archive: invitext-macos-aarch64
+            archive: invitext-portable-macos-aarch64
+            rustflags: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: invitext-windows-x86_64
+            archive: invitext-portable-windows-x86_64
+            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -35,26 +41,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package Unix binaries
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/itx dist/
-          cp target/${{ matrix.target }}/release/invitext dist/
-          cp README.md LICENSE FORMAT.md dist/
-          tar -C dist -czf ${{ matrix.archive }}.tar.gz itx invitext README.md LICENSE FORMAT.md
+          mkdir -p dist/Invitext
+          cp target/${{ matrix.target }}/release/itx dist/Invitext/
+          cp target/${{ matrix.target }}/release/invitext dist/Invitext/
+          cp README.md PORTABLE.md LICENSE FORMAT.md dist/Invitext/
+          cp "assets/portable/README-PORTABLE.txt" dist/Invitext/
+          cp "assets/portable/Invitext Portable.command" dist/Invitext/
+          chmod +x dist/Invitext/itx dist/Invitext/invitext "dist/Invitext/Invitext Portable.command"
+          tar -C dist -czf ${{ matrix.archive }}.tar.gz Invitext
           shasum -a 256 ${{ matrix.archive }}.tar.gz > ${{ matrix.archive }}.tar.gz.sha256
       - name: Package Windows binaries
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/itx.exe" dist/
-          Copy-Item "target/${{ matrix.target }}/release/invitext.exe" dist/
-          Copy-Item README.md, LICENSE, FORMAT.md dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}.zip"
+          New-Item -ItemType Directory -Force dist/Invitext | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/itx.exe" dist/Invitext/
+          Copy-Item "target/${{ matrix.target }}/release/invitext.exe" dist/Invitext/
+          Copy-Item README.md, PORTABLE.md, LICENSE, FORMAT.md dist/Invitext/
+          Copy-Item "assets/portable/README-PORTABLE.txt" dist/Invitext/
+          Copy-Item "assets/portable/Invitext Portable.cmd" dist/Invitext/
+          Compress-Archive -Path dist/Invitext -DestinationPath "${{ matrix.archive }}.zip"
           $hash = (Get-FileHash "${{ matrix.archive }}.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ matrix.archive }}.zip" | Set-Content "${{ matrix.archive }}.zip.sha256"
       - uses: actions/upload-artifact@v7

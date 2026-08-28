@@ -35,6 +35,8 @@ There is no extension allowlist. Invitext can append a note to any regular file,
 
 Prebuilt archives for macOS, Linux, and Windows are attached to tagged [GitHub releases](https://github.com/shazeus/Invitext/releases).
 
+The release archives are portable: extract one to a USB drive or desktop folder and run it without installing Invitext. Windows and Linux builds include their runtime statically; macOS uses only system libraries. See [Portable use](PORTABLE.md) for the exact workflow and platform notes.
+
 With Rust installed:
 
 ```sh
@@ -55,6 +57,19 @@ target/release/invitext
 ```
 
 On Windows they have the usual `.exe` suffix.
+
+### Portable / USB
+
+Download the archive matching the computer, extract it, and keep the whole folder on the USB drive:
+
+```text
+invitext-portable-windows-x86_64.zip
+invitext-portable-linux-x86_64.tar.gz
+invitext-portable-macos-x86_64.tar.gz
+invitext-portable-macos-aarch64.tar.gz
+```
+
+On Windows, double-click `Invitext Portable.cmd`. On macOS, double-click `Invitext Portable.command`; if Gatekeeper quarantines a downloaded unsigned binary, follow the one-time command in [PORTABLE.md](PORTABLE.md). You can always run `itx` directly from an existing terminal.
 
 ## Everyday use
 
