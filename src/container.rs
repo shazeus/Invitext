@@ -6,7 +6,7 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
     aead::{Aead, Payload},
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
