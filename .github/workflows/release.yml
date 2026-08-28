@@ -70,7 +70,8 @@ jobs:
           Copy-Item "assets/portable/Invitext Portable.cmd" dist/Invitext/
           Compress-Archive -Path dist/Invitext -DestinationPath "${{ matrix.archive }}.zip"
           $hash = (Get-FileHash "${{ matrix.archive }}.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  ${{ matrix.archive }}.zip" | Set-Content "${{ matrix.archive }}.zip.sha256"
+          $line = "$hash  ${{ matrix.archive }}.zip`n"
+          [System.IO.File]::WriteAllText("${{ matrix.archive }}.zip.sha256", $line, [System.Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
