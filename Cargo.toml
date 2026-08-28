@@ -1,0 +1,52 @@
+[package]
+name = "invitext"
+version = "0.1.0"
+edition = "2024"
+authors = ["Invitext contributors"]
+description = "Hide authenticated, optionally encrypted text inside everyday files"
+license = "MIT"
+repository = "https://github.com/shazeus/Invitext"
+readme = "README.md"
+keywords = ["steganography", "encryption", "cli", "privacy", "files"]
+categories = ["command-line-utilities", "cryptography"]
+rust-version = "1.88"
+
+[lib]
+name = "invitext"
+path = "src/lib.rs"
+
+[[bin]]
+name = "invitext"
+path = "src/main.rs"
+
+[[bin]]
+name = "itx"
+path = "src/bin/itx.rs"
+
+[dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+blake3 = "1.8"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
+crc32fast = "1.5"
+infer = "0.19"
+rand = "0.9"
+rpassword = "7.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+thiserror = "2.0"
+time = { version = "0.3.47", features = ["formatting"] }
+zeroize = "1.8"
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2.1"
+predicates = "3.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

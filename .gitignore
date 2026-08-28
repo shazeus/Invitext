@@ -1,0 +1,7 @@
+/target/
+*.invitext.*
+*.clean.*
+.DS_Store
+.idea/
+.vscode/
+
