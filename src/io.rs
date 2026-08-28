@@ -37,7 +37,14 @@ pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
 }
 
 pub fn read_file(path: &Path) -> Result<Vec<u8>> {
+    read_file_limited(path, MAX_INPUT_FILE, "input file")
+}
+
+pub fn read_file_limited(path: &Path, limit: u64, kind: &'static str) -> Result<Vec<u8>> {
     let length = file_len(path)?;
+    if length > limit {
+        return Err(InvitextError::SizeLimit { kind, limit });
+    }
     let capacity = usize::try_from(length)
         .map_err(|_| InvitextError::InvalidFormat("input file is too large for this platform"))?;
     let mut file = File::open(path)?;

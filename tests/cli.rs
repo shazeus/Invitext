@@ -3,6 +3,29 @@ use std::fs;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn write_png(path: &std::path::Path, width: u32, height: u32) {
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.extend_from_slice(&[
+                ((x * 17 + y * 31) % 256) as u8,
+                ((x * 47 + y * 13) % 256) as u8,
+                ((x * 7 + y * 61) % 256) as u8,
+                255,
+            ]);
+        }
+    }
+    let file = fs::File::create(path).unwrap();
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&pixels)
+        .unwrap();
+}
+
 #[test]
 fn hide_list_reveal_and_strip() {
     let temp = tempfile::tempdir().unwrap();
@@ -194,4 +217,74 @@ fn tampering_blocks_verify_and_strip() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("carrier data was modified"));
+}
+
+#[test]
+fn png_stealth_mode_round_trip_has_no_appended_signature() {
+    let temp = tempfile::tempdir().unwrap();
+    let carrier = temp.path().join("photo.png");
+    let hidden = temp.path().join("photo.invitext.png");
+    write_png(&carrier, 256, 256);
+
+    Command::cargo_bin("itx")
+        .unwrap()
+        .args([
+            "hide",
+            carrier.to_str().unwrap(),
+            "--mode",
+            "stealth",
+            "--message",
+            "quietly embedded",
+            "--label",
+            "private",
+            "--password",
+            "test-passphrase",
+            "--output",
+            hidden.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Concealed one encrypted note"));
+
+    let bytes = fs::read(&hidden).unwrap();
+    assert!(!bytes.windows(8).any(|window| window == b"INVITEXT"));
+    assert!(!bytes.windows(8).any(|window| window == b"ITXSTG01"));
+
+    Command::cargo_bin("invitext")
+        .unwrap()
+        .args([
+            "reveal",
+            hidden.to_str().unwrap(),
+            "--mode",
+            "stealth",
+            "--password",
+            "test-passphrase",
+        ])
+        .assert()
+        .success()
+        .stdout("quietly embedded\n");
+
+    Command::cargo_bin("itx")
+        .unwrap()
+        .args(["list", hidden.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no Invitext note was found"));
+}
+
+#[test]
+fn inspect_reports_png_stealth_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let carrier = temp.path().join("cover.png");
+    write_png(&carrier, 256, 256);
+
+    Command::cargo_bin("itx")
+        .unwrap()
+        .args(["inspect", carrier.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Stealth       supported")
+                .and(predicate::str::contains("Change limit")),
+        );
 }

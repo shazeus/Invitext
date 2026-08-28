@@ -13,9 +13,13 @@ macOS:
 Linux / existing terminal:
   Run: ./itx --help
 
+Low-density PNG mode:
+  itx inspect photo.png
+  itx hide photo.png --mode stealth -m "private note"
+  itx reveal photo.invitext.png --mode stealth
+
 Use the interactive password prompt. A password passed with --password can be
 recorded in shell history or process listings.
 
 Read PORTABLE.md and README.md for complete examples, integrity checks, format
 compatibility, and macOS/Windows download warnings.
-

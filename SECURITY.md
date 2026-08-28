@@ -14,6 +14,8 @@ Use GitHub's private vulnerability reporting for this repository. Include the In
 - Do not append data to signed executables, signed mobile packages, or documents whose byte identity is externally verified.
 - Treat unencrypted notes as public information.
 - Remember that the trailer reveals the presence and approximate size of a note.
+- Do not describe PNG stealth mode as undetectable. Keep the original private, use a fresh carrier for each note, and stay well below the reported capacity when practical.
+- Do not resize, optimize, color-convert, screenshot, or upload a stealth carrier through a lossy media pipeline before revealing its note.
+- Stealth notes cannot be removed with byte-exact restoration. Retain the untouched original carrier.
 
-Invitext has not received an independent security audit. The cryptographic construction uses established primitives, but implementation defects are still possible.
-
+Invitext has not received an independent security or steganalysis audit. The cryptographic construction uses established primitives, but implementation defects and statistical detection remain possible.

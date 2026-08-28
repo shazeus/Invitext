@@ -374,7 +374,7 @@ fn hash_reader_prefix<R: Read + Seek>(reader: &mut R, length: u64) -> Result<[u8
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn encode_note(label: &[u8], text: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encode_note(label: &[u8], text: &[u8]) -> Result<Vec<u8>> {
     const MAX_LABEL: usize = 16 * 1024;
     if label.len() > MAX_LABEL {
         return Err(InvitextError::SizeLimit {
@@ -393,7 +393,7 @@ fn encode_note(label: &[u8], text: &[u8]) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn decode_note(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn decode_note(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     const MAX_LABEL: usize = 16 * 1024;
     if data.len() < 16 || &data[..4] != NOTE_MAGIC {
         return Err(InvitextError::DamagedPayload);
@@ -531,7 +531,7 @@ fn decode_footer(data: &[u8]) -> Result<Footer> {
     })
 }
 
-fn derive_key(
+pub(crate) fn derive_key(
     password: &[u8],
     salt: &[u8; 16],
     kdf: KdfConfig,
@@ -549,7 +549,7 @@ fn derive_key(
         .map_err(|_| InvitextError::Crypto)
 }
 
-fn validate_kdf(kdf: KdfConfig) -> Result<()> {
+pub(crate) fn validate_kdf(kdf: KdfConfig) -> Result<()> {
     if !(8 * 1024..=256 * 1024).contains(&kdf.memory_kib)
         || !(1..=10).contains(&kdf.iterations)
         || !(1..=16).contains(&kdf.parallelism)
@@ -559,7 +559,7 @@ fn validate_kdf(kdf: KdfConfig) -> Result<()> {
     Ok(())
 }
 
-fn decode_zstd_limited(data: &[u8], limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn decode_zstd_limited(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
 
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(data))?;

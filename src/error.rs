@@ -40,6 +40,15 @@ pub enum InvitextError {
     #[error("operation would exceed the configured {kind} limit of {limit} bytes")]
     SizeLimit { kind: &'static str, limit: u64 },
 
+    #[error("the carrier has {available} bytes of stealth capacity; {required} bytes are required")]
+    InsufficientCapacity { available: usize, required: usize },
+
+    #[error("unsupported stealth carrier: {0}")]
+    UnsupportedStealthCarrier(&'static str),
+
+    #[error("could not process PNG carrier: {0}")]
+    Png(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

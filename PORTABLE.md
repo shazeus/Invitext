@@ -27,6 +27,7 @@ PowerShell and an existing Command Prompt work too:
 cd E:\Invitext
 .\itx.exe inspect E:\photo.jpg
 .\itx.exe hide E:\photo.jpg -m "private note" --encrypt
+.\itx.exe hide E:\photo.png --mode stealth -m "private note"
 ```
 
 Windows SmartScreen may warn because community release binaries are not code-signed. Verify the SHA-256 file beside the download, then use the repository release only if the digest matches.
@@ -54,6 +55,7 @@ From an existing terminal:
 cd /Volumes/MY_USB/Invitext
 ./itx inspect photo.jpg
 ./itx hide photo.jpg -m 'private note' --encrypt
+./itx hide photo.png --mode stealth -m 'private note'
 ```
 
 ## Linux
@@ -81,4 +83,3 @@ The operating system or shell can still leave traces such as command history, re
 ## Safe removal
 
 Wait until Invitext finishes writing, close the portable terminal, and eject the USB drive through the operating system. Invitext calls file and directory sync operations before reporting a successful write, but removing a drive during an operation can still corrupt the output.
-

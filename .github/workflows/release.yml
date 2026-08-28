@@ -52,7 +52,7 @@ jobs:
           mkdir -p dist/Invitext
           cp target/${{ matrix.target }}/release/itx dist/Invitext/
           cp target/${{ matrix.target }}/release/invitext dist/Invitext/
-          cp README.md PORTABLE.md LICENSE FORMAT.md dist/Invitext/
+          cp README.md PORTABLE.md LICENSE FORMAT.md STEALTH.md dist/Invitext/
           cp "assets/portable/README-PORTABLE.txt" dist/Invitext/
           cp "assets/portable/Invitext Portable.command" dist/Invitext/
           chmod +x dist/Invitext/itx dist/Invitext/invitext "dist/Invitext/Invitext Portable.command"
@@ -65,7 +65,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/Invitext | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/itx.exe" dist/Invitext/
           Copy-Item "target/${{ matrix.target }}/release/invitext.exe" dist/Invitext/
-          Copy-Item README.md, PORTABLE.md, LICENSE, FORMAT.md dist/Invitext/
+          Copy-Item README.md, PORTABLE.md, LICENSE, FORMAT.md, STEALTH.md dist/Invitext/
           Copy-Item "assets/portable/README-PORTABLE.txt" dist/Invitext/
           Copy-Item "assets/portable/Invitext Portable.cmd" dist/Invitext/
           Compress-Archive -Path dist/Invitext -DestinationPath "${{ matrix.archive }}.zip"

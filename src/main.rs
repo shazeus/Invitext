@@ -10,9 +10,12 @@ use clap_complete::Shell;
 use invitext::container::{EmbedOptions, EncryptionOptions, KdfConfig};
 use invitext::io::{
     copy_prefix_atomic, default_clean_path, default_hidden_path, embed_file_atomic, file_len,
-    write_atomic,
+    read_file_limited, write_atomic,
 };
-use invitext::{InvitextError, reveal_note_reader, scan_reader};
+use invitext::{
+    InvitextError, MAX_STEALTH_PNG_BYTES, StealthAnalysis, StealthOptions, analyze_png,
+    conceal_png, reveal_note_reader, reveal_png, scan_reader,
+};
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use zeroize::Zeroizing;
@@ -22,8 +25,8 @@ use zeroize::Zeroizing;
     name = "invitext",
     bin_name = "itx",
     version,
-    about = "Hide authenticated, optionally encrypted text inside files",
-    long_about = "Invitext adds private notes to images, archives, documents, media, and other files without changing their visible contents. Use a password to encrypt notes with Argon2id and XChaCha20-Poly1305."
+    about = "Hide encrypted text inside files",
+    long_about = "Invitext conceals encrypted text inside supported PNG color data or appends authenticated notes to images, archives, documents, media, and other files. Use --mode stealth for low-density PNG embedding or the default append mode for broad compatibility."
 )]
 struct Cli {
     /// Print machine-readable JSON where supported
@@ -44,15 +47,15 @@ enum Command {
     #[command(alias = "decode", alias = "extract", alias = "show")]
     Reveal(RevealArgs),
 
-    /// List hidden notes without decrypting them
+    /// List append-mode notes without decrypting them
     #[command(alias = "ls")]
     List(FileArgs),
 
-    /// Check container hashes and optionally decrypt a note
+    /// Verify append hashes or authenticate a stealth note
     #[command(alias = "check")]
     Verify(VerifyArgs),
 
-    /// Remove the latest note or all Invitext data
+    /// Remove the latest append note or all appended Invitext data
     #[command(alias = "clean", alias = "remove")]
     Strip(StripArgs),
 
@@ -86,18 +89,22 @@ struct HideArgs {
     #[arg(short = 'f', long, value_name = "PATH", conflicts_with = "message")]
     message_file: Option<PathBuf>,
 
-    /// A private label stored inside the note
+    /// A label stored inside the note body
     #[arg(short = 'l', long, default_value = "")]
     label: String,
 
-    /// Encrypt the note and prompt for a password if none was supplied
+    /// Encrypt an append note; stealth mode is always encrypted
     #[arg(short = 'e', long)]
     encrypt: bool,
 
     #[command(flatten)]
     password: PasswordArgs,
 
-    /// Output path. Defaults to <name>.invitext.<ext>
+    /// Storage method: compatible appended record or low-density PNG embedding
+    #[arg(long, value_enum, default_value_t = StorageMode::Append)]
+    mode: StorageMode,
+
+    /// Output path. Defaults to `<name>.invitext.<ext>`
     #[arg(short, long, conflicts_with = "in_place")]
     output: Option<PathBuf>,
 
@@ -105,7 +112,7 @@ struct HideArgs {
     #[arg(long, conflicts_with = "output")]
     in_place: bool,
 
-    /// Disable zstd compression
+    /// Disable zstd compression in append mode
     #[arg(long)]
     no_compress: bool,
 
@@ -113,7 +120,7 @@ struct HideArgs {
     #[arg(long)]
     force: bool,
 
-    /// Argon2id memory cost preset
+    /// Argon2id memory cost preset for append mode
     #[arg(long, value_enum, default_value_t = KdfPreset::Standard)]
     kdf: KdfPreset,
 }
@@ -136,6 +143,10 @@ struct PasswordArgs {
 #[derive(Args, Debug)]
 struct RevealArgs {
     file: PathBuf,
+
+    /// Storage method used when the note was hidden
+    #[arg(long, value_enum, default_value_t = StorageMode::Append)]
+    mode: StorageMode,
 
     /// One-based note index (oldest is 1). Defaults to the latest note
     #[arg(short, long, conflicts_with = "all")]
@@ -161,7 +172,11 @@ struct RevealArgs {
 struct VerifyArgs {
     file: PathBuf,
 
-    /// Also decrypt and validate the selected note's contents
+    /// Storage method used when the note was hidden
+    #[arg(long, value_enum, default_value_t = StorageMode::Append)]
+    mode: StorageMode,
+
+    /// Also decrypt an append note; stealth verification is always deep
     #[arg(short, long)]
     deep: bool,
 
@@ -181,7 +196,7 @@ struct StripArgs {
     #[arg(long)]
     latest: bool,
 
-    /// Output path. Defaults to <name>.clean.<ext>
+    /// Output path. Defaults to `<name>.clean.<ext>`
     #[arg(short, long, conflicts_with = "in_place")]
     output: Option<PathBuf>,
 
@@ -194,7 +209,15 @@ struct StripArgs {
     force: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum StorageMode {
+    /// Authenticated trailer; works with almost any file type but is identifiable
+    Append,
+    /// Password-keyed, low-density embedding for supported PNG images
+    Stealth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum KdfPreset {
     Interactive,
     Standard,
@@ -254,14 +277,17 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
-fn hide(args: HideArgs, json: bool) -> anyhow::Result<()> {
+fn hide(mut args: HideArgs, json: bool) -> anyhow::Result<()> {
     ensure_distinct_password_sources(&args.password)?;
-    let text = read_message(args.message, args.message_file)?;
+    let text = read_message(args.message.take(), args.message_file.take())?;
     if text.is_empty() {
         bail!("refusing to hide an empty message");
     }
 
     let supplied_password = resolve_password(&args.password, false)?;
+    if args.mode == StorageMode::Stealth {
+        return hide_stealth(args, text, supplied_password, json);
+    }
     let encryption = if args.encrypt || supplied_password.is_some() {
         let password = match supplied_password {
             Some(password) => password,
@@ -333,8 +359,84 @@ fn hide(args: HideArgs, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hide_stealth(
+    args: HideArgs,
+    text: String,
+    supplied_password: Option<Zeroizing<String>>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if args.no_compress {
+        bail!(
+            "--no-compress is not available in stealth mode; Invitext selects the safer representation automatically"
+        );
+    }
+    if args.kdf != KdfPreset::Standard {
+        bail!("PNG stealth format v1 uses its fixed standard Argon2id profile");
+    }
+    let password = match supplied_password {
+        Some(password) => password,
+        None => prompt_new_password()?,
+    };
+    if password.is_empty() {
+        bail!("password cannot be empty");
+    }
+
+    let output = if args.in_place {
+        args.file.clone()
+    } else {
+        args.output
+            .unwrap_or_else(|| default_hidden_path(&args.file))
+    };
+    if !args.in_place && paths_refer_to_same_file(&args.file, &output) {
+        bail!("output resolves to the carrier; use --in-place explicitly");
+    }
+    let carrier = read_stealth_png(&args.file)
+        .with_context(|| format!("could not read {}", args.file.display()))?;
+    let mut options = StealthOptions::new(password);
+    options.label = args.label;
+    let concealed = conceal_png(&carrier, &text, &options)?;
+    write_atomic(&output, &concealed.bytes, args.in_place || args.force)
+        .with_context(|| format!("could not write {}", output.display()))?;
+
+    if json {
+        #[derive(Serialize)]
+        struct StealthAction {
+            status: &'static str,
+            mode: &'static str,
+            input: String,
+            output: String,
+            bytes: usize,
+            envelope_bytes: usize,
+            changed_channels: usize,
+            maximum_change_percent: f64,
+        }
+        print_json(&StealthAction {
+            status: "hidden",
+            mode: "stealth",
+            input: args.file.display().to_string(),
+            output: output.display().to_string(),
+            bytes: concealed.bytes.len(),
+            envelope_bytes: concealed.envelope_bytes,
+            changed_channels: concealed.changed_channels,
+            maximum_change_percent: concealed.analysis.maximum_change_percent,
+        })?;
+    } else {
+        println!("Concealed one encrypted note in {}", output.display());
+        println!(
+            "{} total · {} channel changes · {:.3}% policy ceiling",
+            human_size(concealed.bytes.len() as u64),
+            concealed.changed_channels,
+            concealed.analysis.maximum_change_percent
+        );
+    }
+    Ok(())
+}
+
 fn reveal(args: RevealArgs, json: bool) -> anyhow::Result<()> {
     ensure_distinct_password_sources(&args.password)?;
+    if args.mode == StorageMode::Stealth {
+        return reveal_stealth(args, json);
+    }
     let total_size = file_len(&args.file)?;
     let mut file = File::open(&args.file)
         .with_context(|| format!("could not read {}", args.file.display()))?;
@@ -427,6 +529,58 @@ fn reveal(args: RevealArgs, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn reveal_stealth(args: RevealArgs, json: bool) -> anyhow::Result<()> {
+    if args.all || args.index.is_some_and(|index| index != 1) {
+        bail!("stealth mode stores one note; --all and indexes other than 1 are not available");
+    }
+    let mut password = resolve_password(&args.password, false)?;
+    if password.is_none() {
+        password = Some(Zeroizing::new(rpassword::prompt_password("Password: ")?));
+    }
+    let password = password.ok_or(InvitextError::PasswordRequired)?;
+    let data = read_stealth_png(&args.file)
+        .with_context(|| format!("could not read {}", args.file.display()))?;
+    let note = reveal_png(&data, &password)?;
+
+    if json {
+        #[derive(Serialize)]
+        struct JsonNote<'a> {
+            index: usize,
+            mode: &'static str,
+            label: &'a str,
+            text: &'a str,
+            created_at: String,
+            encrypted: bool,
+            compressed: bool,
+        }
+        print_json(&[JsonNote {
+            index: 1,
+            mode: "stealth",
+            label: &note.label,
+            text: &note.text,
+            created_at: format_time(note.created_at),
+            encrypted: true,
+            compressed: note.compressed,
+        }])?;
+        return Ok(());
+    }
+
+    if let Some(output) = args.output {
+        if paths_refer_to_same_file(&args.file, &output) {
+            bail!("refusing to overwrite the carrier with revealed text");
+        }
+        write_atomic(&output, note.text.as_bytes(), args.force)
+            .with_context(|| format!("could not write {}", output.display()))?;
+        eprintln!("Revealed one stealth note to {}", output.display());
+    } else {
+        print!("{}", note.text);
+        if !note.text.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
 fn list(file: PathBuf, json: bool) -> anyhow::Result<()> {
     let total_size = file_len(&file)?;
     let mut input =
@@ -453,6 +607,9 @@ fn list(file: PathBuf, json: bool) -> anyhow::Result<()> {
 
 fn verify(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
     ensure_distinct_password_sources(&args.password)?;
+    if args.mode == StorageMode::Stealth {
+        return verify_stealth(args, json);
+    }
     let total_size = file_len(&args.file)?;
     let mut file = File::open(&args.file)
         .with_context(|| format!("could not read {}", args.file.display()))?;
@@ -502,6 +659,39 @@ fn verify(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
         if let Some(index) = deep_verified {
             println!("OK · note #{index} decrypted and decoded successfully");
         }
+    }
+    Ok(())
+}
+
+fn verify_stealth(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
+    if args.index.is_some_and(|index| index != 1) {
+        bail!("stealth mode stores one note; only index 1 is valid");
+    }
+    let mut password = resolve_password(&args.password, false)?;
+    if password.is_none() {
+        password = Some(Zeroizing::new(rpassword::prompt_password("Password: ")?));
+    }
+    let password = password.ok_or(InvitextError::PasswordRequired)?;
+    let data = read_stealth_png(&args.file)
+        .with_context(|| format!("could not read {}", args.file.display()))?;
+    reveal_png(&data, &password)?;
+    if json {
+        #[derive(Serialize)]
+        struct Verification {
+            valid: bool,
+            mode: &'static str,
+            notes: usize,
+            deep_verified: usize,
+        }
+        print_json(&Verification {
+            valid: true,
+            mode: "stealth",
+            notes: 1,
+            deep_verified: 1,
+        })?;
+    } else {
+        println!("OK · stealth envelope decrypted and authenticated");
+        println!("OK · embedded note decoded successfully");
     }
     Ok(())
 }
@@ -579,6 +769,15 @@ fn inspect(file: PathBuf, json: bool) -> anyhow::Result<()> {
         .and_then(|value| value.to_str())
         .unwrap_or("");
     let compatibility = compatibility(extension);
+    let (stealth, stealth_unavailable) = if kind.is_some_and(|value| value.0 == "image/png") {
+        match analyze_png(&read_stealth_png(&file)?) {
+            Ok(analysis) => (Some(analysis), None),
+            Err(InvitextError::UnsupportedStealthCarrier(reason)) => (None, Some(reason)),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        (None, None)
+    };
 
     if json {
         #[derive(Serialize)]
@@ -589,6 +788,8 @@ fn inspect(file: PathBuf, json: bool) -> anyhow::Result<()> {
             detected_extension: Option<&'a str>,
             compatibility: &'a str,
             notes: usize,
+            stealth: Option<StealthAnalysis>,
+            stealth_unavailable: Option<&'a str>,
         }
         print_json(&Inspection {
             file: file.display().to_string(),
@@ -597,6 +798,8 @@ fn inspect(file: PathBuf, json: bool) -> anyhow::Result<()> {
             detected_extension: kind.map(|value| value.1),
             compatibility,
             notes: notes.as_ref().map_or(0, |value| value.notes.len()),
+            stealth,
+            stealth_unavailable,
         })?;
         return Ok(());
     }
@@ -609,6 +812,19 @@ fn inspect(file: PathBuf, json: bool) -> anyhow::Result<()> {
         "Notes         {}",
         notes.as_ref().map_or(0, |value| value.notes.len())
     );
+    if let Some(stealth) = stealth {
+        println!("Stealth       supported ({})", stealth.format);
+        println!(
+            "Capacity      about {} encrypted payload",
+            human_size(stealth.payload_capacity_bytes as u64)
+        );
+        println!(
+            "Change limit  {:.3}% of eligible color channels",
+            stealth.maximum_change_percent
+        );
+    } else if let Some(reason) = stealth_unavailable {
+        println!("Stealth       unavailable ({reason})");
+    }
     Ok(())
 }
 
@@ -631,6 +847,10 @@ fn read_message(message: Option<String>, file: Option<PathBuf>) -> anyhow::Resul
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     Ok(input)
+}
+
+fn read_stealth_png(path: &Path) -> invitext::Result<Vec<u8>> {
+    read_file_limited(path, MAX_STEALTH_PNG_BYTES, "PNG input")
 }
 
 fn ensure_distinct_password_sources(args: &PasswordArgs) -> anyhow::Result<()> {

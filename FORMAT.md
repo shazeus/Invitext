@@ -1,4 +1,6 @@
-# Invitext container format v1
+# Invitext append container format v1
+
+This document covers `--mode append`. The pixel-domain format used by `--mode stealth` is specified separately in [STEALTH.md](STEALTH.md).
 
 This document describes the format written by Invitext 0.1. All integers are unsigned little-endian unless explicitly marked otherwise.
 
@@ -72,4 +74,3 @@ The reference reader validates, in order:
 9. note lengths and UTF-8 validity.
 
 CRC32 is only an early corruption check. It is not a cryptographic authenticator.
-
