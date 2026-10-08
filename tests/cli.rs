@@ -288,3 +288,226 @@ fn inspect_reports_png_stealth_capacity() {
                 .and(predicate::str::contains("Change limit")),
         );
 }
+
+#[test]
+fn encrypted_file_in_pdf_round_trip_and_safe_extraction() {
+    let temp = tempfile::tempdir().unwrap();
+    let carrier = temp.path().join("cover.pdf");
+    let attachment = temp.path().join("archive.zip");
+    let hidden = temp.path().join("hidden.pdf");
+    let output = temp.path().join("restored.zip");
+    let clean = temp.path().join("clean.pdf");
+    let bytes: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+    let original = b"%PDF-1.7\noriginal document\n%%EOF\n";
+    fs::write(&carrier, original).unwrap();
+    fs::write(&attachment, &bytes).unwrap();
+
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&carrier)
+        .arg("--file")
+        .arg(&attachment)
+        .args(["--password", "secret", "--kdf", "interactive"])
+        .arg("-o")
+        .arg(&hidden)
+        .assert()
+        .success();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("verify")
+        .arg(&hidden)
+        .args(["--deep", "--password", "secret"])
+        .assert()
+        .success();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("list")
+        .arg(&hidden)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("file"));
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("reveal")
+        .arg(&hidden)
+        .args(["--password", "secret"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("use itx extract"));
+
+    fs::write(&output, b"keep this file").unwrap();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("extract")
+        .arg(&hidden)
+        .args(["--password", "wrong", "--force"])
+        .arg("-o")
+        .arg(&output)
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&output).unwrap(), b"keep this file");
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("extract")
+        .arg(&hidden)
+        .args(["--password", "secret"])
+        .arg("-o")
+        .arg(&output)
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&output).unwrap(), b"keep this file");
+    Command::cargo_bin("invitext")
+        .unwrap()
+        .arg("--json")
+        .arg("extract")
+        .arg(&hidden)
+        .args(["--password", "secret", "--force"])
+        .arg("-o")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"extracted\""));
+    assert_eq!(fs::read(&output).unwrap(), bytes);
+    assert_eq!(fs::read(&attachment).unwrap(), bytes);
+    let hidden_bytes = fs::read(&hidden).unwrap();
+    let mut damaged = hidden_bytes.clone();
+    damaged[original.len() + 76] ^= 0xff;
+    let damaged_carrier = temp.path().join("damaged.pdf");
+    fs::write(&damaged_carrier, damaged).unwrap();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("extract")
+        .arg(&damaged_carrier)
+        .args(["--password", "secret", "--force"])
+        .arg("-o")
+        .arg(&output)
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&output).unwrap(), bytes);
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("extract")
+        .arg(&hidden)
+        .args(["--password", "secret", "--force"])
+        .arg("-o")
+        .arg(&hidden)
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&hidden).unwrap(), hidden_bytes);
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("strip")
+        .arg(&hidden)
+        .arg("-o")
+        .arg(&clean)
+        .assert()
+        .success();
+    assert_eq!(fs::read(&clean).unwrap(), original);
+}
+
+#[test]
+fn binary_file_in_png_stealth_and_capacity_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let carrier = temp.path().join("cover.png");
+    let attachment = temp.path().join("document.pdf");
+    let hidden = temp.path().join("hidden.png");
+    let output = temp.path().join("restored.pdf");
+    write_png(&carrier, 256, 256);
+    let bytes = b"%PDF-1.7\n\x00\xff binary document\n%%EOF";
+    fs::write(&attachment, bytes).unwrap();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&carrier)
+        .arg("--file")
+        .arg(&attachment)
+        .args(["--mode", "stealth", "--password", "secret"])
+        .arg("-o")
+        .arg(&hidden)
+        .assert()
+        .success();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("verify")
+        .arg(&hidden)
+        .args(["--mode", "stealth", "--password", "secret"])
+        .assert()
+        .success();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("extract")
+        .arg(&hidden)
+        .args(["--mode", "stealth", "--password", "secret"])
+        .arg("-o")
+        .arg(&output)
+        .assert()
+        .success();
+    assert_eq!(fs::read(output).unwrap(), bytes);
+    assert!(
+        !fs::read(&hidden)
+            .unwrap()
+            .windows(8)
+            .any(|bytes| bytes == b"INVITEXT")
+    );
+
+    let tiny = temp.path().join("tiny.png");
+    let refused = temp.path().join("refused.png");
+    write_png(&tiny, 16, 16);
+    let original = fs::read(&tiny).unwrap();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&tiny)
+        .arg("--file")
+        .arg(&attachment)
+        .args(["--mode", "stealth", "--password", "secret"])
+        .arg("-o")
+        .arg(&refused)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("capacity"));
+    assert!(!refused.exists());
+    assert_eq!(fs::read(&tiny).unwrap(), original);
+}
+
+#[test]
+fn attachment_options_cannot_destroy_source_or_mix_with_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let carrier = temp.path().join("cover.pdf");
+    let attachment = temp.path().join("file.zip");
+    fs::write(&carrier, b"%PDF-1.7").unwrap();
+    fs::write(&attachment, b"source file").unwrap();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&carrier)
+        .arg("--file")
+        .arg(&attachment)
+        .args(["--password", "secret", "--force"])
+        .arg("-o")
+        .arg(&attachment)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("attachment source"));
+    assert_eq!(fs::read(&attachment).unwrap(), b"source file");
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&carrier)
+        .arg("--file")
+        .arg(&attachment)
+        .args(["-m", "text"])
+        .assert()
+        .failure();
+    Command::cargo_bin("itx")
+        .unwrap()
+        .arg("hide")
+        .arg(&carrier)
+        .arg("--file")
+        .arg(&attachment)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot prompt"));
+    assert!(!temp.path().join("cover.invitext.pdf").exists());
+}

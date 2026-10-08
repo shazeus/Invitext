@@ -11,6 +11,7 @@ use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::FORMAT_VERSION;
+use crate::content::{EmbeddedContent, decode_content_body, encode_file_body};
 use crate::error::{InvitextError, Result};
 
 const FOOTER_MAGIC: &[u8; 8] = b"INVITEXT";
@@ -20,6 +21,7 @@ const FOOTER_SIZE: usize = 96;
 const PAYLOAD_HEADER_SIZE: usize = 76;
 const FLAG_ENCRYPTED: u16 = 1 << 0;
 const FLAG_COMPRESSED: u16 = 1 << 1;
+const FLAG_FILE: u16 = 1 << 2;
 const DEFAULT_MAX_PAYLOAD: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_TEXT: u64 = 128 * 1024 * 1024;
 
@@ -75,6 +77,7 @@ pub struct NoteInfo {
     pub index: usize,
     pub encrypted: bool,
     pub compressed: bool,
+    pub is_file: bool,
     pub created_at: i64,
     pub stored_bytes: u64,
     pub carrier_bytes: u64,
@@ -144,15 +147,63 @@ pub fn build_record(
         });
     }
 
-    let mut note = encode_note(options.label.as_bytes(), text.as_bytes())?;
-    let mut flags = 0u16;
+    let note = encode_note(options.label.as_bytes(), text.as_bytes())?;
+    build_encoded_record(
+        carrier_hash,
+        carrier_len,
+        note,
+        text.len() as u64,
+        false,
+        options,
+    )
+}
+
+/// Builds an encrypted attachment record without encoding binary bytes as text.
+pub fn build_file_record(
+    carrier_hash: [u8; 32],
+    carrier_len: u64,
+    filename: &str,
+    data: &[u8],
+    options: &EmbedOptions,
+) -> Result<Vec<u8>> {
+    if options
+        .encryption
+        .as_ref()
+        .is_none_or(|encryption| encryption.password.is_empty())
+    {
+        return Err(InvitextError::PasswordRequired);
+    }
+    let note = encode_file_body(filename, data, &options.label)?;
+    build_encoded_record(
+        carrier_hash,
+        carrier_len,
+        note,
+        data.len() as u64,
+        true,
+        options,
+    )
+}
+
+fn build_encoded_record(
+    carrier_hash: [u8; 32],
+    carrier_len: u64,
+    note: Vec<u8>,
+    plaintext_len: u64,
+    is_file: bool,
+    options: &EmbedOptions,
+) -> Result<Vec<u8>> {
+    let mut note = Zeroizing::new(note);
+    let mut flags = if is_file { FLAG_FILE } else { 0 };
     let mut body = if options.compression {
-        flags |= FLAG_COMPRESSED;
-        let compressed = zstd::stream::encode_all(Cursor::new(&note), 9)?;
-        note.zeroize();
-        compressed
+        let compressed = Zeroizing::new(zstd::stream::encode_all(Cursor::new(note.as_slice()), 9)?);
+        if compressed.len() < note.len() {
+            flags |= FLAG_COMPRESSED;
+            compressed
+        } else {
+            Zeroizing::new(std::mem::take(&mut *note))
+        }
     } else {
-        note
+        Zeroizing::new(std::mem::take(&mut *note))
     };
 
     let mut salt = [0u8; 16];
@@ -178,20 +229,22 @@ pub fn build_record(
             kdf,
             salt,
             nonce,
-            plaintext_len: text.len() as u64,
+            plaintext_len,
         };
         let aad = encode_payload_header(&header);
         let cipher = XChaCha20Poly1305::new((&*key).into());
-        let plaintext_body = Zeroizing::new(std::mem::take(&mut body));
-        body = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext_body,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| InvitextError::Crypto)?;
+        let plaintext_body = Zeroizing::new(std::mem::take(&mut *body));
+        body = Zeroizing::new(
+            cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &plaintext_body,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| InvitextError::Crypto)?,
+        );
     }
 
     let header = PayloadHeader {
@@ -200,7 +253,7 @@ pub fn build_record(
         kdf,
         salt,
         nonce,
-        plaintext_len: text.len() as u64,
+        plaintext_len,
     };
     let mut payload = encode_payload_header(&header);
     payload.extend_from_slice(&body);
@@ -272,6 +325,7 @@ pub fn scan_reader<R: Read + Seek>(
             index: 0,
             encrypted: header.flags & FLAG_ENCRYPTED != 0,
             compressed: header.flags & FLAG_COMPRESSED != 0,
+            is_file: header.flags & FLAG_FILE != 0,
             created_at: header.created_at,
             stored_bytes: footer.payload_len + FOOTER_SIZE as u64,
             carrier_bytes: footer.carrier_len,
@@ -304,6 +358,23 @@ pub fn reveal_note_reader<R: Read + Seek>(
     index: usize,
     password: Option<&str>,
 ) -> Result<EmbeddedNote> {
+    reveal_content_reader(reader, total_size, index, password)?.into_note()
+}
+
+pub fn reveal_content(
+    data: &[u8],
+    index: usize,
+    password: Option<&str>,
+) -> Result<EmbeddedContent> {
+    reveal_content_reader(&mut Cursor::new(data), data.len() as u64, index, password)
+}
+
+pub fn reveal_content_reader<R: Read + Seek>(
+    reader: &mut R,
+    total_size: u64,
+    index: usize,
+    password: Option<&str>,
+) -> Result<EmbeddedContent> {
     let scan_result = scan_reader(reader, total_size, true)?;
     if index == 0 || index > scan_result.notes.len() {
         return Err(InvitextError::InvalidIndex {
@@ -322,7 +393,7 @@ pub fn reveal_note_reader<R: Read + Seek>(
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload)?;
     let header = decode_payload_header(&payload)?;
-    let mut body = payload[PAYLOAD_HEADER_SIZE..].to_vec();
+    let mut body = Zeroizing::new(payload[PAYLOAD_HEADER_SIZE..].to_vec());
 
     if header.flags & FLAG_ENCRYPTED != 0 {
         let password = password.ok_or(InvitextError::PasswordRequired)?;
@@ -330,37 +401,41 @@ pub fn reveal_note_reader<R: Read + Seek>(
         let mut key = Zeroizing::new([0u8; 32]);
         derive_key(password.as_bytes(), &header.salt, header.kdf, &mut key)?;
         let cipher = XChaCha20Poly1305::new((&*key).into());
-        body = cipher
-            .decrypt(
-                XNonce::from_slice(&header.nonce),
-                Payload {
-                    msg: &body,
-                    aad: &payload[..PAYLOAD_HEADER_SIZE],
-                },
-            )
-            .map_err(|_| InvitextError::DecryptionFailed)?;
+        body = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&header.nonce),
+                    Payload {
+                        msg: &body,
+                        aad: &payload[..PAYLOAD_HEADER_SIZE],
+                    },
+                )
+                .map_err(|_| InvitextError::DecryptionFailed)?,
+        );
     }
 
-    let mut decoded = if header.flags & FLAG_COMPRESSED != 0 {
+    let decoded = if header.flags & FLAG_COMPRESSED != 0 {
         let decoded = decode_zstd_limited(&body, DEFAULT_MAX_TEXT + 1024 * 1024)?;
         body.zeroize();
-        decoded
+        Zeroizing::new(decoded)
     } else {
         body
     };
-    let (label, text) = decode_note(&decoded)?;
-    decoded.zeroize();
-    if text.len() as u64 != header.plaintext_len {
+    let content = decode_content_body(
+        &decoded,
+        header.flags & FLAG_FILE != 0,
+        header.created_at,
+        header.flags & FLAG_ENCRYPTED != 0,
+        header.flags & FLAG_COMPRESSED != 0,
+    )?;
+    let decoded_len = match &content {
+        EmbeddedContent::Text(note) => note.text.len(),
+        EmbeddedContent::File(file) => file.data.len(),
+    };
+    if decoded_len as u64 != header.plaintext_len {
         return Err(InvitextError::DamagedPayload);
     }
-
-    Ok(EmbeddedNote {
-        text: String::from_utf8(text).map_err(|_| InvitextError::InvalidUtf8)?,
-        label: String::from_utf8(label).map_err(|_| InvitextError::InvalidUtf8)?,
-        created_at: header.created_at,
-        encrypted: header.flags & FLAG_ENCRYPTED != 0,
-        compressed: header.flags & FLAG_COMPRESSED != 0,
-    })
+    Ok(content)
 }
 
 fn hash_reader_prefix<R: Read + Seek>(reader: &mut R, length: u64) -> Result<[u8; 32]> {
@@ -453,8 +528,13 @@ fn decode_payload_header(payload: &[u8]) -> Result<PayloadHeader> {
         return Err(InvitextError::UnsupportedVersion(version));
     }
     let flags = u16::from_le_bytes(payload[6..8].try_into().unwrap());
-    if flags & !(FLAG_ENCRYPTED | FLAG_COMPRESSED) != 0 {
+    if flags & !(FLAG_ENCRYPTED | FLAG_COMPRESSED | FLAG_FILE) != 0 {
         return Err(InvitextError::InvalidFormat("unknown payload flags"));
+    }
+    if flags & FLAG_FILE != 0 && flags & FLAG_ENCRYPTED == 0 {
+        return Err(InvitextError::InvalidFormat(
+            "file payloads must be encrypted",
+        ));
     }
     let mut salt = [0u8; 16];
     salt.copy_from_slice(&payload[28..44]);
@@ -562,9 +642,11 @@ pub(crate) fn validate_kdf(kdf: KdfConfig) -> Result<()> {
 pub(crate) fn decode_zstd_limited(data: &[u8], limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
 
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(data))?;
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(data))?;
+    // Bound the decoder's history allocation as well as its output size.
+    decoder.window_log_max(27)?;
     let mut limited = decoder.take(limit + 1);
-    let mut output = Vec::new();
+    let mut output = Zeroizing::new(Vec::new());
     limited.read_to_end(&mut output)?;
     if output.len() as u64 > limit {
         return Err(InvitextError::SizeLimit {
@@ -572,7 +654,7 @@ pub(crate) fn decode_zstd_limited(data: &[u8], limit: u64) -> Result<Vec<u8>> {
             limit,
         });
     }
-    Ok(output)
+    Ok(std::mem::take(&mut *output))
 }
 
 #[cfg(test)]
@@ -656,6 +738,76 @@ mod tests {
         assert!(matches!(
             scan(&encoded, true),
             Err(InvitextError::DamagedPayload)
+        ));
+    }
+
+    #[test]
+    fn empty_attachments_and_unhelpful_compression() {
+        let mut options = encrypted("secret");
+        options.compression = true;
+        let encoded =
+            build_file_record(*blake3::hash(b"").as_bytes(), 0, "empty.zip", b"", &options)
+                .unwrap();
+        let file = reveal_content(&encoded, 1, Some("secret"))
+            .unwrap()
+            .into_file()
+            .unwrap();
+        assert!(file.data.is_empty());
+        assert!(!file.compressed);
+        options.encryption.as_mut().unwrap().password.clear();
+        assert!(matches!(
+            build_file_record([0; 32], 0, "empty.zip", b"", &options),
+            Err(InvitextError::PasswordRequired)
+        ));
+    }
+
+    #[test]
+    fn binary_attachment_round_trip_in_a_mixed_record_chain() {
+        let carrier = b"%PDF-1.7\ncarrier";
+        let text_record = embed_bytes(carrier, "legacy text", &EmbedOptions::default()).unwrap();
+        let data: Vec<u8> = (0..1024).map(|index| (index % 256) as u8).collect();
+        for compression in [false, true] {
+            let mut options = encrypted("secret");
+            options.compression = compression;
+            let record = build_file_record(
+                *blake3::hash(&text_record).as_bytes(),
+                text_record.len() as u64,
+                "arşiv.zip",
+                &data,
+                &options,
+            )
+            .unwrap();
+            let mut hidden = text_record.clone();
+            hidden.extend_from_slice(&record);
+            let scan = scan(&hidden, true).unwrap();
+            assert_eq!(scan.notes.len(), 2);
+            assert!(!scan.notes[0].is_file);
+            assert!(scan.notes[1].is_file);
+            assert_eq!(reveal_note(&hidden, 1, None).unwrap().text, "legacy text");
+            assert!(matches!(
+                reveal_content(&hidden, 2, None),
+                Err(InvitextError::PasswordRequired)
+            ));
+            assert!(matches!(
+                reveal_content(&hidden, 2, Some("wrong")),
+                Err(InvitextError::DecryptionFailed)
+            ));
+            assert!(matches!(
+                reveal_note(&hidden, 2, Some("secret")),
+                Err(InvitextError::FilePayload)
+            ));
+            let file = reveal_content(&hidden, 2, Some("secret"))
+                .unwrap()
+                .into_file()
+                .unwrap();
+            assert_eq!(file.data.as_slice(), data);
+            assert_eq!(file.filename, "arşiv.zip");
+            assert_eq!(file.label, "private note");
+            assert_eq!(file.compressed, compression);
+        }
+        assert!(matches!(
+            build_file_record([0; 32], 0, "file.zip", b"", &EmbedOptions::default()),
+            Err(InvitextError::PasswordRequired)
         ));
     }
 }

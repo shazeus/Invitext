@@ -1,9 +1,9 @@
 [package]
 name = "invitext"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Invitext contributors"]
-description = "Conceal encrypted text in PNG pixels or append authenticated notes to files"
+description = "Hide encrypted text and files in PNG pixels or authenticated append records"
 license = "MIT"
 repository = "https://github.com/shazeus/Invitext"
 readme = "README.md"

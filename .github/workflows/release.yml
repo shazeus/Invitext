@@ -45,6 +45,20 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test Unix executables
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/release/itx --version
+          target/${{ matrix.target }}/release/invitext extract --help
+      - name: Smoke-test Windows executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/itx.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "itx smoke test failed" }
+          & "target/${{ matrix.target }}/release/invitext.exe" extract --help
+          if ($LASTEXITCODE -ne 0) { throw "invitext smoke test failed" }
       - name: Package Unix binaries
         if: runner.os != 'Windows'
         shell: bash
@@ -52,7 +66,7 @@ jobs:
           mkdir -p dist/Invitext
           cp target/${{ matrix.target }}/release/itx dist/Invitext/
           cp target/${{ matrix.target }}/release/invitext dist/Invitext/
-          cp README.md PORTABLE.md LICENSE FORMAT.md STEALTH.md dist/Invitext/
+          cp README.md PORTABLE.md LICENSE FORMAT.md STEALTH.md SECURITY.md CHANGELOG.md dist/Invitext/
           cp "assets/portable/README-PORTABLE.txt" dist/Invitext/
           cp "assets/portable/Invitext Portable.command" dist/Invitext/
           chmod +x dist/Invitext/itx dist/Invitext/invitext "dist/Invitext/Invitext Portable.command"
@@ -65,7 +79,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/Invitext | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/itx.exe" dist/Invitext/
           Copy-Item "target/${{ matrix.target }}/release/invitext.exe" dist/Invitext/
-          Copy-Item README.md, PORTABLE.md, LICENSE, FORMAT.md, STEALTH.md dist/Invitext/
+          Copy-Item README.md, PORTABLE.md, LICENSE, FORMAT.md, STEALTH.md, SECURITY.md, CHANGELOG.md dist/Invitext/
           Copy-Item "assets/portable/README-PORTABLE.txt" dist/Invitext/
           Copy-Item "assets/portable/Invitext Portable.cmd" dist/Invitext/
           Compress-Archive -Path dist/Invitext -DestinationPath "${{ matrix.archive }}.zip"

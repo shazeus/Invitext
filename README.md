@@ -1,8 +1,8 @@
 # Invitext
 
-Invitext hides encrypted text inside ordinary files. It has two deliberately different storage modes:
+Invitext hides text and encrypted files inside ordinary files. You can put a ZIP inside a PNG, store a PDF in an image, or use a PDF as the carrier for an encrypted archive. It has two storage modes:
 
-- `stealth` distributes one encrypted note through the color data of a supported PNG, without an Invitext footer or other fixed signature;
+- `stealth` distributes one encrypted payload through the color data of a supported PNG, without an Invitext footer or other fixed signature;
 - `append` places a versioned, authenticated record after any carrier file and favors compatibility, capacity, and exact removal over concealment.
 
 The short command is `itx`. The full `invitext` command is installed alongside it and behaves identically.
@@ -19,16 +19,17 @@ Password:
 The spare key is in the blue box
 ```
 
-Invitext is deliberately boring about the important parts: it does not invent its own cipher, overwrite the source file by default, or claim forensic undetectability. Stealth mode is designed to reduce obvious structural and statistical signals, not to defeat every possible analyst or comparison against the original image.
+The source file is kept by default. Encryption uses established primitives. Stealth mode reduces obvious structural and statistical signals, but it cannot hide differences from someone who has the original image, and forensic undetectability is not guaranteed.
 
 ## What it does
 
 - Provides password-keyed, content-adaptive PNG embedding with no public format marker.
 - Uses Hamming matrix coding to encode three bits while changing at most one of seven selected channels.
 - Enforces a conservative density ceiling and reports carrier capacity before anything is written.
-- Adds one or more append-mode text notes to images, archives, documents, media, and other regular files.
-- Encrypts notes with XChaCha20-Poly1305 and derives keys with Argon2id.
-- Compresses text with zstd when compression makes it smaller.
+- Adds text notes and encrypted file attachments to images, archives, documents, media, and other regular files.
+- Restores binary attachments byte for byte, including their original contents and encrypted filename metadata.
+- Encrypts payloads with XChaCha20-Poly1305 and derives keys with Argon2id.
+- Compresses payloads with zstd when compression makes them smaller.
 - Detects a changed carrier, damaged payload, and incorrect password as separate failures where the storage format permits it.
 - Reads and writes large append carriers as streams rather than loading a multi-gigabyte archive into memory.
 - Provides human-readable output and stable `--json` output for scripts.
@@ -100,11 +101,48 @@ itx verify photo.invitext.png --mode stealth
 
 A password is mandatory in stealth mode. The label, timestamp, compression flag, lengths, and note text are all inside the encrypted envelope. The outer salt and nonce are random and are themselves distributed through password-keyed image locations.
 
-There is no password-free `list` operation for a stealth note. Exposing one would require a stable discovery signal, which is exactly what this mode avoids. Stealth mode stores one note per image; do not layer notes with different passwords into the same PNG.
+There is no password-free `list` operation for a stealth payload. Exposing one would require a stable discovery signal. Stealth mode stores one note or attachment per image; do not layer payloads with different passwords into the same PNG.
 
 Do not mix append and stealth records in one carrier. Stealth mode rejects PNG files with trailing data rather than silently discarding it during recompression.
 
 Keep the original carrier. A pixel-domain note cannot be stripped back to the byte-exact original because the original least-significant bits are not retained.
+
+## Hide a file inside another file
+
+Use `--file` for binary content. Unlike `--message-file`, it does not interpret the contents as UTF-8. Attachments always require a password, even without `--encrypt`.
+
+Put a ZIP inside a PNG's pixels:
+
+```sh
+itx inspect photo.png
+itx hide photo.png --mode stealth --file archive.zip
+itx extract photo.invitext.png --mode stealth -o restored.zip
+```
+
+The encrypted payload must fit the reported PNG capacity, including its filename, label, and format overhead. Most ZIPs and PDFs are already compressed, so compressing them again rarely helps. For larger files, use append mode:
+
+```sh
+itx hide report.pdf --file archive.zip --label "project backup"
+itx extract report.invitext.pdf -o restored.zip
+itx verify report.invitext.pdf --deep
+```
+
+The same commands work with a PDF attachment, a JPEG carrier, or any other regular file in append mode. Test the resulting carrier in its normal viewer; some applications reject or remove trailing bytes. Append records have a visible format signature and increase the carrier's size.
+
+Each `hide` call adds one attachment. Append mode can contain several files, mixed with text notes; `list` shows each record's kind. Extraction selects the latest record unless you give `--index`:
+
+```sh
+itx hide report.invitext.pdf --file invoice.pdf --in-place
+itx list report.invitext.pdf
+itx extract report.invitext.pdf --index 1 -o restored.zip
+itx extract report.invitext.pdf --index 2 -o invoice.pdf
+```
+
+Attachments are limited to 128 MiB before compression and are processed in memory. Append carriers are streamed and may be up to 16 GiB; PNG carriers also have a separate capacity limit. Empty files are valid attachments.
+
+`extract` requires an explicit output path. The stored filename is encrypted metadata, never a destination path. Existing files are preserved unless you pass `--force`, and no output is written until authentication and decoding succeed. Extraction neither opens the restored file nor unpacks an archive.
+
+Use `reveal` or `decode` for text. `extract` (alias `unpack`) restores attachments; it no longer acts as an alias for text reveal.
 
 ## Compatible append mode
 
@@ -130,9 +168,9 @@ List notes without revealing their contents:
 
 ```console
 $ itx list image.invitext.png
-2 note(s) in image.invitext.png
-  #1   encrypted  intact     2026-08-28T09:31:04Z · 312 B
-  #2   plain      intact     2026-08-28T09:34:51Z · 228 B
+2 record(s) in image.invitext.png
+  #1   text  encrypted  intact     2026-08-28T09:31:04Z · 312 B
+  #2   text  plain      intact     2026-08-28T09:34:51Z · 228 B
 ```
 
 Reveal, verify, or remove append records:
@@ -193,7 +231,7 @@ PNG stealth format v1 uses the `standard` profile as a fixed format parameter. T
 
 ## Security model
 
-Encrypted notes use Argon2id v1.3, random salts, XChaCha20-Poly1305 with fresh nonces, authenticated metadata, and bounded KDF and decompression parameters.
+Encrypted payloads use Argon2id v1.3, random salts, XChaCha20-Poly1305 with fresh nonces, authenticated metadata, and bounded KDF and decompression parameters.
 
 PNG stealth mode additionally uses:
 
@@ -203,7 +241,7 @@ PNG stealth mode additionally uses:
 - Hamming `(7,3)` matrix embedding, producing a hard maximum near 1.43% modified eligible channels;
 - no cleartext magic, timestamp, label, payload length, or algorithm flag in the PNG data.
 
-The append trailer reveals that Invitext data exists, its approximate size, creation time, and whether it is encrypted. Stealth mode removes that trailer and reduces low-bit changes, but it cannot hide differences from someone who has the original image. Advanced steganalysis may still assign a non-zero likelihood to a modified image. “Undetectable” is not a claim this project makes.
+The append trailer reveals that Invitext data exists, its approximate size, creation time, whether it is encrypted, and whether it contains text or a file. Stealth mode removes that trailer and reduces low-bit changes, but it cannot hide differences from someone who has the original image. Advanced steganalysis may still assign a non-zero likelihood to a modified image. "Undetectable" is not a claim this project makes.
 
 Lossless PNG bytes are recompressed when a note is concealed. Visual pixels and alpha are preserved apart from selected color-channel least-significant bits, but compressed size and chunk layout can change. Any later resize, color conversion, optimizer that rewrites pixels, lossy upload, or screenshot will normally destroy the note.
 
@@ -213,9 +251,9 @@ No independent cryptographic or steganalysis audit has been completed. Do not ma
 
 ## Format and stability
 
-Both storage formats are versioned independently. Invitext v0.2 continues to read and write append container version 1 and adds PNG stealth envelope version 1. The layouts and validation rules are documented in [FORMAT.md](FORMAT.md) and [STEALTH.md](STEALTH.md).
+Both storage formats are versioned independently. Append container v1 and PNG stealth envelope v1 support text and file bodies. Existing text carriers remain readable; releases before 0.3 reject the new attachment flag. The layouts and validation rules are documented in [FORMAT.md](FORMAT.md) and [STEALTH.md](STEALTH.md).
 
-Append notes form a backward-walked chain, so multiple notes and lossless removal are unambiguous. PNG stealth v1 stores one envelope and intentionally provides neither public discovery nor lossless removal.
+Append records form a backward-walked chain, so multiple payloads and lossless removal are unambiguous. PNG stealth v1 stores one envelope and provides neither public discovery nor lossless removal.
 
 ## Development
 
@@ -228,7 +266,7 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-The tests exercise both executable names, encrypted and unencrypted append round trips, PNG stealth round trips, wrong passwords, absence of public format magic, bounded per-channel changes, alpha preservation, JSON output, and byte-exact restoration of append carriers.
+The tests exercise both executable names, text and binary round trips in both modes, compressed and raw attachments, wrong passwords, capacity failures, safe extraction, absence of public format magic, bounded per-channel changes, alpha preservation, JSON output, and byte-exact restoration of append carriers.
 
 ## License
 

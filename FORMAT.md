@@ -2,7 +2,7 @@
 
 This document covers `--mode append`. The pixel-domain format used by `--mode stealth` is specified separately in [STEALTH.md](STEALTH.md).
 
-This document describes the format written by Invitext 0.1. All integers are unsigned little-endian unless explicitly marked otherwise.
+All integers are unsigned little-endian unless explicitly marked otherwise. Invitext 0.3 adds a file-body flag to the existing v1 container. Earlier readers reject this flag; existing text records remain compatible.
 
 An Invitext file is an ordinary carrier followed by one or more records:
 
@@ -40,9 +40,9 @@ The payload must begin exactly at `carrier_len`, and `carrier_len + payload_len`
 | 24 | 4 | Argon2 parallelism, or zero when unencrypted |
 | 28 | 16 | Random salt, or zero when unencrypted |
 | 44 | 24 | XChaCha20 nonce, or zero when unencrypted |
-| 68 | 8 | Original UTF-8 text length |
+| 68 | 8 | Original text or attachment byte length, excluding metadata |
 
-Flag bit 0 means encrypted. Flag bit 1 means zstd-compressed. The footer and payload flags must match.
+Flag bit 0 means encrypted. Flag bit 1 means zstd-compressed. Flag bit 2 means a file body. File records must be encrypted. The footer and payload flags must match.
 
 For encrypted records, the entire 76-byte payload header is XChaCha20-Poly1305 additional authenticated data. The bytes after the header are the ciphertext and 16-byte Poly1305 tag. Argon2id version 1.3 derives a 256-bit key directly into the cipher key buffer.
 
@@ -59,6 +59,24 @@ Compression is applied before encryption. Once decrypted and decompressed, the n
 
 The decoded body must end immediately after the declared text. Implementations should enforce resource limits before allocating or decompressing untrusted lengths. Invitext currently accepts at most 16 KiB of label text, 128 MiB of note text, and 256 MiB of stored payload.
 
+## File body
+
+When bit 2 is set, the decrypted and decompressed body is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII magic `FILE` |
+| 4 | 4 | UTF-8 label length |
+| 8 | 4 | UTF-8 filename length |
+| 12 | 8 | Raw file byte length |
+| 20 | variable | Label bytes, filename bytes, then raw file bytes |
+
+The body must end immediately after the declared file bytes. The file length must also equal the original byte length in the authenticated payload header. Labels are limited to 16 KiB, filenames to 255 UTF-8 bytes, and file content to 128 MiB before compression. Binary content need not be valid UTF-8, and zero-byte files are accepted.
+
+The filename is a basename, not a path. Empty names, `.` and `..`, slashes, backslashes, colons, and control characters are rejected. The CLI always requires an explicit extraction path and never uses the stored name to choose where to write.
+
+Compression precedes encryption and is used only when it reduces the body size. Older append writers may have compressed larger bodies; readers still accept them.
+
 ## Validation order
 
 The reference reader validates, in order:
@@ -71,6 +89,6 @@ The reference reader validates, in order:
 6. KDF parameter bounds;
 7. AEAD authentication and decryption;
 8. bounded decompression;
-9. note lengths and UTF-8 validity.
+9. body type, lengths, metadata validity, and original byte length.
 
 CRC32 is only an early corruption check. It is not a cryptographic authenticator.

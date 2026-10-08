@@ -9,12 +9,13 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use invitext::container::{EmbedOptions, EncryptionOptions, KdfConfig};
 use invitext::io::{
-    copy_prefix_atomic, default_clean_path, default_hidden_path, embed_file_atomic, file_len,
-    read_file_limited, write_atomic,
+    copy_prefix_atomic, default_clean_path, default_hidden_path, embed_attachment_file_atomic,
+    embed_file_atomic, file_len, read_file_limited, write_atomic,
 };
 use invitext::{
-    InvitextError, MAX_STEALTH_PNG_BYTES, StealthAnalysis, StealthOptions, analyze_png,
-    conceal_png, reveal_note_reader, reveal_png, scan_reader,
+    InvitextError, MAX_ATTACHMENT_BYTES, MAX_STEALTH_PNG_BYTES, StealthAnalysis, StealthOptions,
+    analyze_png, conceal_file_png, conceal_png, reveal_content_reader, reveal_note_reader,
+    reveal_png, reveal_png_content, scan_reader,
 };
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -25,8 +26,8 @@ use zeroize::Zeroizing;
     name = "invitext",
     bin_name = "itx",
     version,
-    about = "Hide encrypted text inside files",
-    long_about = "Invitext conceals encrypted text inside supported PNG color data or appends authenticated notes to images, archives, documents, media, and other files. Use --mode stealth for low-density PNG embedding or the default append mode for broad compatibility."
+    about = "Hide encrypted text and files inside other files",
+    long_about = "Invitext hides text or encrypted file attachments in supported PNG color data or authenticated append records. Use hide --file PATH for ZIP, PDF, or other binary content, then extract --output PATH to restore it. Use --mode stealth for low-density PNG embedding or the default append mode for broad carrier compatibility."
 )]
 struct Cli {
     /// Print machine-readable JSON where supported
@@ -39,19 +40,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Add a hidden text note to a carrier file
+    /// Hide text or an encrypted file inside a carrier
     #[command(alias = "embed", alias = "encode")]
     Hide(HideArgs),
 
     /// Read a hidden note
-    #[command(alias = "decode", alias = "extract", alias = "show")]
+    #[command(alias = "decode", alias = "show")]
     Reveal(RevealArgs),
 
-    /// List append-mode notes without decrypting them
+    /// Extract an encrypted attachment to an explicit output path
+    #[command(alias = "unpack")]
+    Extract(ExtractArgs),
+
+    /// List append-mode text and file records without decrypting them
     #[command(alias = "ls")]
     List(FileArgs),
 
-    /// Verify append hashes or authenticate a stealth note
+    /// Verify append hashes or authenticate a stealth payload
     #[command(alias = "check")]
     Verify(VerifyArgs),
 
@@ -89,7 +94,11 @@ struct HideArgs {
     #[arg(short = 'f', long, value_name = "PATH", conflicts_with = "message")]
     message_file: Option<PathBuf>,
 
-    /// A label stored inside the note body
+    /// Hide a binary file (ZIP, PDF, or any other file); always encrypted
+    #[arg(long = "file", value_name = "PATH", conflicts_with_all = ["message", "message_file"])]
+    attachment: Option<PathBuf>,
+
+    /// A label stored inside the payload body
     #[arg(short = 'l', long, default_value = "")]
     label: String,
 
@@ -166,6 +175,36 @@ struct RevealArgs {
 
     #[command(flatten)]
     password: PasswordArgs,
+}
+
+#[derive(Args, Debug)]
+struct ExtractArgs {
+    /// Carrier containing an encrypted file
+    file: PathBuf,
+
+    /// Exact path to write the restored file; stored names never choose a path
+    #[arg(short, long)]
+    output: PathBuf,
+
+    #[arg(long, value_enum, default_value_t = StorageMode::Append)]
+    mode: StorageMode,
+
+    /// One-based payload index; defaults to the latest append record
+    #[arg(short, long)]
+    index: Option<usize>,
+
+    /// Replace an existing output file
+    #[arg(long)]
+    force: bool,
+
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+struct AttachmentInput {
+    path: PathBuf,
+    filename: String,
+    data: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Args, Debug)]
@@ -266,6 +305,7 @@ fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::Hide(args) => hide(args, cli.json),
         Command::Reveal(args) => reveal(args, cli.json),
+        Command::Extract(args) => extract(args, cli.json),
         Command::List(args) => list(args.file, cli.json),
         Command::Verify(args) => verify(args, cli.json),
         Command::Strip(args) => strip(args, cli.json),
@@ -279,16 +319,21 @@ fn run() -> anyhow::Result<()> {
 
 fn hide(mut args: HideArgs, json: bool) -> anyhow::Result<()> {
     ensure_distinct_password_sources(&args.password)?;
-    let text = read_message(args.message.take(), args.message_file.take())?;
-    if text.is_empty() {
+    let attachment = args.attachment.take().map(read_attachment).transpose()?;
+    let text = Zeroizing::new(if attachment.is_some() {
+        String::new()
+    } else {
+        read_message(args.message.take(), args.message_file.take())?
+    });
+    if attachment.is_none() && text.is_empty() {
         bail!("refusing to hide an empty message");
     }
 
     let supplied_password = resolve_password(&args.password, false)?;
     if args.mode == StorageMode::Stealth {
-        return hide_stealth(args, text, supplied_password, json);
+        return hide_stealth(args, &text, attachment.as_ref(), supplied_password, json);
     }
-    let encryption = if args.encrypt || supplied_password.is_some() {
+    let encryption = if args.encrypt || supplied_password.is_some() || attachment.is_some() {
         let password = match supplied_password {
             Some(password) => password,
             None => prompt_new_password()?,
@@ -335,9 +380,25 @@ fn hide(mut args: HideArgs, json: bool) -> anyhow::Result<()> {
     if !args.in_place && paths_refer_to_same_file(&args.file, &output) {
         bail!("output resolves to the carrier; use --in-place explicitly");
     }
+    if attachment
+        .as_ref()
+        .is_some_and(|file| paths_refer_to_same_file(&file.path, &output))
+    {
+        bail!("refusing to overwrite the attachment source with its carrier");
+    }
     let overwrite = args.in_place || args.force;
-    let output_size = embed_file_atomic(&args.file, &output, &text, &options, overwrite)
-        .with_context(|| format!("could not write {}", output.display()))?;
+    let output_size = match &attachment {
+        Some(file) => embed_attachment_file_atomic(
+            &args.file,
+            &output,
+            &file.filename,
+            &file.data,
+            &options,
+            overwrite,
+        ),
+        None => embed_file_atomic(&args.file, &output, &text, &options, overwrite),
+    }
+    .with_context(|| format!("could not write {}", output.display()))?;
 
     let result = ActionResult {
         status: "hidden",
@@ -349,7 +410,14 @@ fn hide(mut args: HideArgs, json: bool) -> anyhow::Result<()> {
     if json {
         print_json(&result)?;
     } else {
-        println!("Hidden note #{note_count} in {}", output.display());
+        if attachment.is_some() {
+            println!(
+                "Hidden encrypted file #{note_count} in {}",
+                output.display()
+            );
+        } else {
+            println!("Hidden note #{note_count} in {}", output.display());
+        }
         println!(
             "{} total · {}",
             human_size(output_size),
@@ -361,7 +429,8 @@ fn hide(mut args: HideArgs, json: bool) -> anyhow::Result<()> {
 
 fn hide_stealth(
     args: HideArgs,
-    text: String,
+    text: &str,
+    attachment: Option<&AttachmentInput>,
     supplied_password: Option<Zeroizing<String>>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -390,11 +459,17 @@ fn hide_stealth(
     if !args.in_place && paths_refer_to_same_file(&args.file, &output) {
         bail!("output resolves to the carrier; use --in-place explicitly");
     }
+    if attachment.is_some_and(|file| paths_refer_to_same_file(&file.path, &output)) {
+        bail!("refusing to overwrite the attachment source with its carrier");
+    }
     let carrier = read_stealth_png(&args.file)
         .with_context(|| format!("could not read {}", args.file.display()))?;
     let mut options = StealthOptions::new(password);
     options.label = args.label;
-    let concealed = conceal_png(&carrier, &text, &options)?;
+    let concealed = match attachment {
+        Some(file) => conceal_file_png(&carrier, &file.filename, &file.data, &options)?,
+        None => conceal_png(&carrier, text, &options)?,
+    };
     write_atomic(&output, &concealed.bytes, args.in_place || args.force)
         .with_context(|| format!("could not write {}", output.display()))?;
 
@@ -421,7 +496,8 @@ fn hide_stealth(
             maximum_change_percent: concealed.analysis.maximum_change_percent,
         })?;
     } else {
-        println!("Concealed one encrypted note in {}", output.display());
+        let kind = if attachment.is_some() { "file" } else { "note" };
+        println!("Concealed one encrypted {kind} in {}", output.display());
         println!(
             "{} total · {} channel changes · {:.3}% policy ceiling",
             human_size(concealed.bytes.len() as u64),
@@ -430,6 +506,104 @@ fn hide_stealth(
         );
     }
     Ok(())
+}
+
+fn read_attachment(path: PathBuf) -> anyhow::Result<AttachmentInput> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("attachment filename must be valid UTF-8")?
+        .to_owned();
+    let data = Zeroizing::new(
+        read_file_limited(&path, MAX_ATTACHMENT_BYTES, "attachment")
+            .with_context(|| format!("could not read attachment {}", path.display()))?,
+    );
+    Ok(AttachmentInput {
+        path,
+        filename,
+        data,
+    })
+}
+
+fn extract(args: ExtractArgs, json: bool) -> anyhow::Result<()> {
+    ensure_distinct_password_sources(&args.password)?;
+    if paths_refer_to_same_file(&args.file, &args.output) {
+        bail!("refusing to overwrite the carrier with an extracted file");
+    }
+    let index;
+    let content = if args.mode == StorageMode::Stealth {
+        index = args.index.unwrap_or(1);
+        if index != 1 {
+            return Err(InvitextError::InvalidIndex {
+                requested: index,
+                available: 1,
+            }
+            .into());
+        }
+        let data = read_stealth_png(&args.file)?;
+        let password = extraction_password(&args.password)?;
+        reveal_png_content(&data, &password)?
+    } else {
+        let total_size = file_len(&args.file)?;
+        let mut carrier = File::open(&args.file)?;
+        let result = scan_reader(&mut carrier, total_size, false)?;
+        index = args.index.unwrap_or(result.notes.len());
+        let selected = result
+            .notes
+            .get(index.checked_sub(1).unwrap_or(usize::MAX))
+            .ok_or(InvitextError::InvalidIndex {
+                requested: index,
+                available: result.notes.len(),
+            })?;
+        if !selected.is_file {
+            return Err(InvitextError::TextPayload.into());
+        }
+        let password = extraction_password(&args.password)?;
+        reveal_content_reader(&mut carrier, total_size, index, Some(&password))?
+    };
+    let file = content.into_file()?;
+    write_atomic(&args.output, &file.data, args.force)
+        .with_context(|| format!("could not write {}", args.output.display()))?;
+    if json {
+        #[derive(Serialize)]
+        struct Extraction<'a> {
+            status: &'static str,
+            index: usize,
+            filename: &'a str,
+            label: &'a str,
+            output: String,
+            bytes: usize,
+            blake3: String,
+        }
+        print_json(&Extraction {
+            status: "extracted",
+            index,
+            filename: &file.filename,
+            label: &file.label,
+            output: args.output.display().to_string(),
+            bytes: file.data.len(),
+            blake3: blake3::hash(&file.data).to_hex().to_string(),
+        })?;
+    } else {
+        println!("Extracted {} → {}", file.filename, args.output.display());
+        println!(
+            "{} · authenticated and decrypted",
+            human_size(file.data.len() as u64)
+        );
+    }
+    Ok(())
+}
+
+fn extraction_password(args: &PasswordArgs) -> anyhow::Result<Zeroizing<String>> {
+    if let Some(password) = resolve_password(args, false)? {
+        return Ok(password);
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "cannot prompt for a password without a terminal; use --password-file or --password-env"
+        );
+    }
+    Ok(Zeroizing::new(rpassword::prompt_password("Password: ")?))
 }
 
 fn reveal(args: RevealArgs, json: bool) -> anyhow::Result<()> {
@@ -591,11 +765,12 @@ fn list(file: PathBuf, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{} note(s) in {}", result.notes.len(), file.display());
+    println!("{} record(s) in {}", result.notes.len(), file.display());
     for note in &result.notes {
         println!(
-            "  #{:<3} {:<10} {:<10} {} · {}",
+            "  #{:<3} {:<5} {:<10} {:<10} {} · {}",
             note.index,
+            if note.is_file { "file" } else { "text" },
             if note.encrypted { "encrypted" } else { "plain" },
             if note.intact { "intact" } else { "modified" },
             format_time(note.created_at),
@@ -633,7 +808,7 @@ fn verify(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
         if encrypted && password.is_none() {
             password = Some(Zeroizing::new(rpassword::prompt_password("Password: ")?));
         }
-        reveal_note_reader(
+        reveal_content_reader(
             &mut file,
             total_size,
             index,
@@ -655,9 +830,9 @@ fn verify(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
             deep_verified,
         })?;
     } else {
-        println!("OK · {} structurally valid note(s)", result.notes.len());
+        println!("OK · {} structurally valid record(s)", result.notes.len());
         if let Some(index) = deep_verified {
-            println!("OK · note #{index} decrypted and decoded successfully");
+            println!("OK · record #{index} decrypted and decoded successfully");
         }
     }
     Ok(())
@@ -665,7 +840,7 @@ fn verify(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
 
 fn verify_stealth(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
     if args.index.is_some_and(|index| index != 1) {
-        bail!("stealth mode stores one note; only index 1 is valid");
+        bail!("stealth mode stores one payload; only index 1 is valid");
     }
     let mut password = resolve_password(&args.password, false)?;
     if password.is_none() {
@@ -674,7 +849,7 @@ fn verify_stealth(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
     let password = password.ok_or(InvitextError::PasswordRequired)?;
     let data = read_stealth_png(&args.file)
         .with_context(|| format!("could not read {}", args.file.display()))?;
-    reveal_png(&data, &password)?;
+    reveal_png_content(&data, &password)?;
     if json {
         #[derive(Serialize)]
         struct Verification {
@@ -691,7 +866,7 @@ fn verify_stealth(args: VerifyArgs, json: bool) -> anyhow::Result<()> {
         })?;
     } else {
         println!("OK · stealth envelope decrypted and authenticated");
-        println!("OK · embedded note decoded successfully");
+        println!("OK · embedded payload decoded successfully");
     }
     Ok(())
 }

@@ -11,7 +11,7 @@ Invitext does not need an installer, service, account, registry entry, or config
 | Intel Mac | `invitext-portable-macos-x86_64.tar.gz` |
 | Apple Silicon Mac (M1 and newer) | `invitext-portable-macos-aarch64.tar.gz` |
 
-Each archive contains both command names, this guide, the main README, the license, the format document, and a small terminal launcher.
+Each archive contains both command names, this guide, the main README, the license, both format specifications, the security policy, the changelog, and a small terminal launcher.
 
 ## Windows
 
@@ -28,6 +28,8 @@ cd E:\Invitext
 .\itx.exe inspect E:\photo.jpg
 .\itx.exe hide E:\photo.jpg -m "private note" --encrypt
 .\itx.exe hide E:\photo.png --mode stealth -m "private note"
+.\itx.exe hide E:\report.pdf --file E:\backup.zip
+.\itx.exe extract E:\report.invitext.pdf -o E:\restored.zip
 ```
 
 Windows SmartScreen may warn because community release binaries are not code-signed. Verify the SHA-256 file beside the download, then use the repository release only if the digest matches.
@@ -56,6 +58,8 @@ cd /Volumes/MY_USB/Invitext
 ./itx inspect photo.jpg
 ./itx hide photo.jpg -m 'private note' --encrypt
 ./itx hide photo.png --mode stealth -m 'private note'
+./itx hide photo.png --mode stealth --file backup.zip
+./itx extract photo.invitext.png --mode stealth -o restored.zip
 ```
 
 ## Linux
@@ -73,6 +77,10 @@ If an archive tool did not preserve executable permissions:
 ```sh
 chmod +x itx invitext "Invitext Portable.command"
 ```
+
+## File attachments
+
+File attachments work from the portable executables too. They require a password and an explicit extraction path. Keep within the carrier's capacity in PNG mode; append mode accepts attachments up to 128 MiB. The portable terminal starts in the bundle folder, so use absolute paths when the carrier lives elsewhere.
 
 ## Where data is stored
 

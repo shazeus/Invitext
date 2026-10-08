@@ -18,6 +18,17 @@ Low-density PNG mode:
   itx hide photo.png --mode stealth -m "private note"
   itx reveal photo.invitext.png --mode stealth
 
+Encrypted file attachments:
+  itx hide report.pdf --file backup.zip
+  itx extract report.invitext.pdf -o restored.zip
+  itx hide photo.png --mode stealth --file document.pdf
+  itx extract photo.invitext.png --mode stealth -o restored.pdf
+
+File attachments require a password and are limited to 128 MiB before
+compression. PNG mode also requires enough image capacity. Use inspect first.
+Extraction never opens files or unpacks archives, and preserves existing files
+unless --force is explicitly given.
+
 Use the interactive password prompt. A password passed with --password can be
 recorded in shell history or process listings.
 

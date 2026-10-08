@@ -19,9 +19,8 @@ use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::container::{
-    EmbeddedNote, KdfConfig, decode_note, decode_zstd_limited, derive_key, encode_note,
-};
+use crate::container::{EmbeddedNote, KdfConfig, decode_zstd_limited, derive_key, encode_note};
+use crate::content::{EmbeddedContent, decode_content_body, encode_file_body};
 use crate::error::{InvitextError, Result};
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"ITXSTG01";
@@ -31,9 +30,10 @@ const HEADER_CIPHERTEXT_BYTES: usize = HEADER_PLAINTEXT_BYTES + 16;
 const OUTER_PREFIX_BYTES: usize = 16 + 24;
 const FIXED_ENVELOPE_BYTES: usize = OUTER_PREFIX_BYTES + HEADER_CIPHERTEXT_BYTES;
 const FLAG_COMPRESSED: u16 = 1;
+const FLAG_FILE: u16 = 2;
 pub const MAX_STEALTH_PNG_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DECODED_PNG: usize = MAX_STEALTH_PNG_BYTES as usize;
-const MAX_DECODED_NOTE: u64 = 128 * 1024 * 1024 + 16 * 1024 + 16;
+const MAX_DECODED_NOTE: u64 = 128 * 1024 * 1024 + 16 * 1024 + 255 + 20;
 
 // Only the most locally active 40% of eligible color channels are considered.
 const CANDIDATE_NUMERATOR: usize = 2;
@@ -109,6 +109,40 @@ pub fn analyze_png(data: &[u8]) -> Result<StealthAnalysis> {
 }
 
 pub fn conceal_png(data: &[u8], text: &str, options: &StealthOptions) -> Result<StealthOutput> {
+    if text.len() as u64 > crate::MAX_ATTACHMENT_BYTES {
+        return Err(InvitextError::SizeLimit {
+            kind: "text",
+            limit: crate::MAX_ATTACHMENT_BYTES,
+        });
+    }
+    conceal_body(
+        data,
+        encode_note(options.label.as_bytes(), text.as_bytes())?,
+        false,
+        options,
+    )
+}
+
+pub fn conceal_file_png(
+    carrier: &[u8],
+    filename: &str,
+    data: &[u8],
+    options: &StealthOptions,
+) -> Result<StealthOutput> {
+    conceal_body(
+        carrier,
+        encode_file_body(filename, data, &options.label)?,
+        true,
+        options,
+    )
+}
+
+fn conceal_body(
+    data: &[u8],
+    note: Vec<u8>,
+    is_file: bool,
+    options: &StealthOptions,
+) -> Result<StealthOutput> {
     if options.password.is_empty() {
         return Err(InvitextError::PasswordRequired);
     }
@@ -121,13 +155,18 @@ pub fn conceal_png(data: &[u8], text: &str, options: &StealthOptions) -> Result<
     let usable_positions = usable_position_count(candidates.len());
     candidates.truncate(usable_positions);
 
-    let mut note = Zeroizing::new(encode_note(options.label.as_bytes(), text.as_bytes())?);
-    let compressed = zstd::stream::encode_all(Cursor::new(note.as_slice()), 9)?;
-    let (flags, body_plaintext) = if compressed.len() < note.len() {
-        (FLAG_COMPRESSED, Zeroizing::new(compressed))
+    let mut note = Zeroizing::new(note);
+    let decoded_len = u32::try_from(note.len()).map_err(|_| InvitextError::SizeLimit {
+        kind: "decoded stealth payload",
+        limit: MAX_DECODED_NOTE,
+    })?;
+    let compressed = Zeroizing::new(zstd::stream::encode_all(Cursor::new(note.as_slice()), 9)?);
+    let (compression_flag, body_plaintext) = if compressed.len() < note.len() {
+        (FLAG_COMPRESSED, compressed)
     } else {
         (0, Zeroizing::new(std::mem::take(&mut *note)))
     };
+    let flags = compression_flag | if is_file { FLAG_FILE } else { 0 };
 
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
@@ -158,11 +197,6 @@ pub fn conceal_png(data: &[u8], text: &str, options: &StealthOptions) -> Result<
         kind: "stealth payload",
         limit: u32::MAX as u64,
     })?;
-    let decoded_len =
-        u32::try_from(body_plaintext.len()).map_err(|_| InvitextError::SizeLimit {
-            kind: "decoded stealth payload",
-            limit: u32::MAX as u64,
-        })?;
     let mut header_plaintext = encode_header(flags, body_len, decoded_len, options.created_at);
     let header_ciphertext = cipher
         .encrypt(
@@ -204,6 +238,10 @@ pub fn conceal_png(data: &[u8], text: &str, options: &StealthOptions) -> Result<
 }
 
 pub fn reveal_png(data: &[u8], password: &str) -> Result<EmbeddedNote> {
+    reveal_png_content(data, password)?.into_note()
+}
+
+pub fn reveal_png_content(data: &[u8], password: &str) -> Result<EmbeddedContent> {
     if password.is_empty() {
         return Err(InvitextError::PasswordRequired);
     }
@@ -234,17 +272,18 @@ pub fn reveal_png(data: &[u8], password: &str) -> Result<EmbeddedNote> {
     derive_key(password.as_bytes(), &salt, KdfConfig::default(), &mut key)?;
     let cipher = XChaCha20Poly1305::new((&*key).into());
     let aad = envelope_aad(&fingerprint);
-    let mut header_plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: header_ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| InvitextError::DecryptionFailed)?;
+    let header_plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: header_ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| InvitextError::DecryptionFailed)?,
+    );
     let header = decode_header(&header_plaintext)?;
-    header_plaintext.zeroize();
 
     let total_envelope = FIXED_ENVELOPE_BYTES
         .checked_add(header.body_ciphertext_len)
@@ -255,15 +294,21 @@ pub fn reveal_png(data: &[u8], password: &str) -> Result<EmbeddedNote> {
     let envelope = Zeroizing::new(matrix_extract(&image.pixels, &positions, total_envelope)?);
     let body_ciphertext = &envelope[FIXED_ENVELOPE_BYTES..];
     let body_nonce = increment_nonce(nonce);
-    let mut body = cipher
-        .decrypt(
-            XNonce::from_slice(&body_nonce),
-            Payload {
-                msg: body_ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| InvitextError::DecryptionFailed)?;
+    let mut body = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&body_nonce),
+                Payload {
+                    msg: body_ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| InvitextError::DecryptionFailed)?,
+    );
+    // v0.2.0 wrote compressed lengths for compressed text. Accept those legacy
+    // headers after AEAD authentication; new writers record the decoded length.
+    let legacy_compressed_text =
+        header.flags == FLAG_COMPRESSED && body.len() == header.decoded_body_len;
     if body.len() != header.decoded_body_len && header.flags & FLAG_COMPRESSED == 0 {
         body.zeroize();
         return Err(InvitextError::DamagedPayload);
@@ -272,24 +317,21 @@ pub fn reveal_png(data: &[u8], password: &str) -> Result<EmbeddedNote> {
     let mut decoded = if header.flags & FLAG_COMPRESSED != 0 {
         let decoded = decode_zstd_limited(&body, MAX_DECODED_NOTE)?;
         body.zeroize();
-        decoded
+        Zeroizing::new(decoded)
     } else {
         body
     };
-    if decoded.len() != header.decoded_body_len {
+    if decoded.len() != header.decoded_body_len && !legacy_compressed_text {
         decoded.zeroize();
         return Err(InvitextError::DamagedPayload);
     }
-    let (label, text) = decode_note(&decoded)?;
-    decoded.zeroize();
-
-    Ok(EmbeddedNote {
-        text: String::from_utf8(text).map_err(|_| InvitextError::InvalidUtf8)?,
-        label: String::from_utf8(label).map_err(|_| InvitextError::InvalidUtf8)?,
-        created_at: header.created_at,
-        encrypted: true,
-        compressed: header.flags & FLAG_COMPRESSED != 0,
-    })
+    decode_content_body(
+        &decoded,
+        header.flags & FLAG_FILE != 0,
+        header.created_at,
+        true,
+        header.flags & FLAG_COMPRESSED != 0,
+    )
 }
 
 struct EnvelopeHeader {
@@ -320,7 +362,7 @@ fn decode_header(data: &[u8]) -> Result<EnvelopeHeader> {
         return Err(InvitextError::UnsupportedVersion(version));
     }
     let flags = u16::from_le_bytes(data[10..12].try_into().unwrap());
-    if flags & !FLAG_COMPRESSED != 0 {
+    if flags & !(FLAG_COMPRESSED | FLAG_FILE) != 0 {
         return Err(InvitextError::DamagedPayload);
     }
     let body_ciphertext_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
@@ -804,6 +846,53 @@ mod tests {
     }
 
     #[test]
+    fn reads_legacy_compressed_text_headers() {
+        let password = "legacy password";
+        let text = "compressible text ".repeat(100);
+        let options = StealthOptions::new(Zeroizing::new(password.into()));
+        let hidden = conceal_png(&carrier(256, 256), &text, &options).unwrap();
+        let mut image = decode_png(&hidden.bytes).unwrap();
+        let fingerprint = cover_fingerprint(&image);
+        let mut candidates = ranked_candidates(&image);
+        select_and_shuffle_candidates(&mut candidates, password.as_bytes(), &fingerprint);
+        candidates.truncate(usable_position_count(candidates.len()));
+        let positions: Vec<usize> = candidates.iter().map(|candidate| candidate.index).collect();
+        let mut envelope =
+            matrix_extract(&image.pixels, &positions, hidden.envelope_bytes).unwrap();
+        let salt: [u8; 16] = envelope[..16].try_into().unwrap();
+        let nonce: [u8; 24] = envelope[16..40].try_into().unwrap();
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password.as_bytes(), &salt, KdfConfig::default(), &mut key).unwrap();
+        let cipher = XChaCha20Poly1305::new((&*key).into());
+        let aad = envelope_aad(&fingerprint);
+        let mut header = cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &envelope[40..FIXED_ENVELOPE_BYTES],
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_header(&header).unwrap().flags, FLAG_COMPRESSED);
+        let compressed_len = (hidden.envelope_bytes - FIXED_ENVELOPE_BYTES - 16) as u32;
+        header[16..20].copy_from_slice(&compressed_len.to_le_bytes());
+        let encrypted_header = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &header,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        envelope[40..FIXED_ENVELOPE_BYTES].copy_from_slice(&encrypted_header);
+        matrix_embed(&mut image.pixels, &positions, &envelope).unwrap();
+        let legacy_png = encode_png(image).unwrap();
+        assert_eq!(reveal_png(&legacy_png, password).unwrap().text, text);
+    }
+
+    #[test]
     fn stealth_round_trip_and_wrong_password() {
         let source = carrier(256, 256);
         let mut options = StealthOptions::new(Zeroizing::new("correct horse".into()));
@@ -846,6 +935,37 @@ mod tests {
             }
         }
         assert_eq!(changes, hidden.changed_channels);
+        let note = reveal_png(&hidden.bytes, "password").unwrap();
+        assert!(note.compressed);
+        assert_eq!(note.text, "text ".repeat(300));
+    }
+
+    #[test]
+    fn compressed_and_raw_binary_attachments_round_trip() {
+        let carrier = carrier(256, 256);
+        let options = StealthOptions::new(Zeroizing::new("secret".into()));
+        let compressed = vec![0; 5000];
+        let mut rng = ChaCha20Rng::from_seed([42; 32]);
+        let mut raw = vec![0; 500];
+        rng.fill_bytes(&mut raw);
+        for (data, expect_compressed) in [(&compressed, true), (&raw, false)] {
+            let hidden = conceal_file_png(&carrier, "payload.zip", data, &options).unwrap();
+            assert!(matches!(
+                reveal_png(&hidden.bytes, "secret"),
+                Err(InvitextError::FilePayload)
+            ));
+            assert!(matches!(
+                reveal_png_content(&hidden.bytes, "wrong"),
+                Err(InvitextError::DecryptionFailed)
+            ));
+            let file = reveal_png_content(&hidden.bytes, "secret")
+                .unwrap()
+                .into_file()
+                .unwrap();
+            assert_eq!(file.filename, "payload.zip");
+            assert_eq!(file.data.as_slice(), data);
+            assert_eq!(file.compressed, expect_compressed);
+        }
     }
 
     #[test]

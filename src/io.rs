@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
-use crate::container::{EmbedOptions, build_record};
+use crate::container::{EmbedOptions, build_file_record, build_record};
 use crate::error::{InvitextError, Result};
 
 pub const MAX_INPUT_FILE: u64 = 16 * 1024 * 1024 * 1024;
@@ -47,9 +47,17 @@ pub fn read_file_limited(path: &Path, limit: u64, kind: &'static str) -> Result<
     }
     let capacity = usize::try_from(length)
         .map_err(|_| InvitextError::InvalidFormat("input file is too large for this platform"))?;
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let mut data = Vec::with_capacity(capacity);
-    file.read_to_end(&mut data)?;
+    file.take(limit.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(InvitextError::SizeLimit { kind, limit });
+    }
+    if data.len() as u64 != length {
+        return Err(InvitextError::InvalidFormat(
+            "input changed while it was being read",
+        ));
+    }
     Ok(data)
 }
 
@@ -75,11 +83,7 @@ pub fn write_atomic(path: &Path, data: &[u8], overwrite: bool) -> Result<()> {
         temp.as_file().set_permissions(permissions)?;
     }
 
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    temp.persist(path)
-        .map_err(|error| InvitextError::Io(error.error))?;
+    publish_temp(temp, path, overwrite)?;
     sync_parent(parent);
     Ok(())
 }
@@ -110,11 +114,7 @@ pub fn copy_prefix_atomic(input: &Path, output: &Path, length: u64, overwrite: b
     if let Ok(metadata) = fs::metadata(input) {
         temp.as_file().set_permissions(metadata.permissions())?;
     }
-    if output.exists() {
-        fs::remove_file(output)?;
-    }
-    temp.persist(output)
-        .map_err(|error| InvitextError::Io(error.error))?;
+    publish_temp(temp, output, overwrite)?;
     sync_parent(parent);
     Ok(())
 }
@@ -142,11 +142,7 @@ pub fn append_atomic(input: &Path, output: &Path, suffix: &[u8], overwrite: bool
     if let Ok(metadata) = fs::metadata(input) {
         temp.as_file().set_permissions(metadata.permissions())?;
     }
-    if output.exists() {
-        fs::remove_file(output)?;
-    }
-    temp.persist(output)
-        .map_err(|error| InvitextError::Io(error.error))?;
+    publish_temp(temp, output, overwrite)?;
     sync_parent(parent);
     Ok(())
 }
@@ -159,6 +155,31 @@ pub fn embed_file_atomic(
     text: &str,
     options: &EmbedOptions,
     overwrite: bool,
+) -> Result<u64> {
+    embed_record_atomic(input, output, overwrite, |hash, length| {
+        build_record(hash, length, text, options)
+    })
+}
+
+/// Streams the carrier while keeping the bounded attachment in memory.
+pub fn embed_attachment_file_atomic(
+    input: &Path,
+    output: &Path,
+    filename: &str,
+    data: &[u8],
+    options: &EmbedOptions,
+    overwrite: bool,
+) -> Result<u64> {
+    embed_record_atomic(input, output, overwrite, |hash, length| {
+        build_file_record(hash, length, filename, data, options)
+    })
+}
+
+fn embed_record_atomic(
+    input: &Path,
+    output: &Path,
+    overwrite: bool,
+    build: impl FnOnce([u8; 32], u64) -> Result<Vec<u8>>,
 ) -> Result<u64> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -197,19 +218,25 @@ pub fn embed_file_atomic(
         ));
     }
 
-    let record = build_record(*hasher.finalize().as_bytes(), copied, text, options)?;
+    let record = build(*hasher.finalize().as_bytes(), copied)?;
     temp.write_all(&record)?;
     temp.as_file_mut().sync_all()?;
     if let Ok(metadata) = fs::metadata(input) {
         temp.as_file().set_permissions(metadata.permissions())?;
     }
-    if output.exists() {
-        fs::remove_file(output)?;
-    }
-    temp.persist(output)
-        .map_err(|error| InvitextError::Io(error.error))?;
+    publish_temp(temp, output, overwrite)?;
     sync_parent(parent);
     Ok(copied + record.len() as u64)
+}
+
+fn publish_temp(temp: NamedTempFile, output: &Path, overwrite: bool) -> Result<()> {
+    if overwrite {
+        temp.persist(output)
+    } else {
+        temp.persist_noclobber(output)
+    }
+    .map_err(|error| InvitextError::Io(error.error))?;
+    Ok(())
 }
 
 fn sync_parent(parent: &Path) {

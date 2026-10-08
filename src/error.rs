@@ -25,6 +25,12 @@ pub enum InvitextError {
     #[error("this note is not encrypted")]
     NotEncrypted,
 
+    #[error("this payload contains a file; use itx extract with --output")]
+    FilePayload,
+
+    #[error("this payload contains text; use itx reveal")]
+    TextPayload,
+
     #[error("unsupported Invitext format version {0}")]
     UnsupportedVersion(u16),
 

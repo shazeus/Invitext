@@ -50,17 +50,23 @@ The 32-byte header plaintext contains:
 | 8 | 2 | Envelope version (`1`) |
 | 10 | 2 | Flags |
 | 12 | 4 | Encrypted body length |
-| 16 | 4 | Decoded note-body length |
+| 16 | 4 | Decoded body length, including metadata |
 | 20 | 8 | Signed Unix creation timestamp |
 | 28 | 4 | Random padding |
 
-The internal magic is visible only after successful authenticated decryption. The header uses the outer nonce; the body uses that nonce incremented as a 192-bit integer. Both authenticate a domain-separated cover fingerprint. The note body uses the same label-and-text representation as append format v1 and is zstd-compressed only when compression makes it smaller.
+The internal magic is visible only after successful authenticated decryption. The header uses the outer nonce; the body uses that nonce incremented as a 192-bit integer. Both authenticate a domain-separated cover fingerprint.
+
+Flag bit 0 means zstd-compressed. Bit 1 means a file body, introduced in Invitext 0.3; older readers reject it. The body uses the `NOTE` or `FILE` representation in [FORMAT.md](FORMAT.md). File content is limited to 128 MiB before compression and must also fit the image's capacity after compression and encryption. The filename and content are both encrypted. Compression is used only when it makes the body smaller.
+
+### Compatibility with 0.2.0 text carriers
+
+Invitext 0.2.0 wrote the compressed body size into the decoded-length field when compression was selected, then incorrectly checked it against the decompressed size. The current reader accepts these legacy text headers after authentication and bounded decompression. New writers always store the actual decoded body length; file bodies receive the strict length check.
 
 ## Discovery and removal
 
-Stealth format intentionally has no password-free discovery operation. `itx list` only recognizes append records. Use `itx reveal --mode stealth` or `itx verify --mode stealth` with the password.
+Stealth format has no password-free discovery operation. `itx list` only recognizes append records. Use `itx reveal --mode stealth` for text, `itx extract --mode stealth -o PATH` for files, or `itx verify --mode stealth` with the password.
 
-One stealth envelope is supported per image. Concealing again with the same password overwrites the deterministic placement prefix; using different passwords can create overlapping, unrecoverable data. Start from the original carrier for every new note.
+One stealth envelope is supported per image. Concealing again with the same password overwrites the deterministic placement prefix; using different passwords can create overlapping, unrecoverable data. Start from the original carrier for every new payload.
 
 There is no lossless `strip` operation because the original low bits are not stored. Keep the original carrier if exact restoration matters.
 
